@@ -16,7 +16,11 @@
 /// TO DO : Add Neutral Mesons measurement to the current full jet measuremtn
 
 #include "PWGJE/Core/JetDerivedDataUtilities.h"
+#include "PWGJE/DataModel/EMCALClusters.h"
 #include "PWGJE/DataModel/Jet.h"
+#include "PWGJE/DataModel/JetReducedData.h"
+
+#include "Common/CCDB/TriggerAliases.h"
 
 #include <CommonConstants/MathConstants.h>
 #include <Framework/AnalysisDataModel.h>
@@ -24,23 +28,76 @@
 #include <Framework/Configurable.h>
 #include <Framework/HistogramRegistry.h>
 #include <Framework/HistogramSpec.h>
+#include <Framework/InitContext.h>
 #include <Framework/runDataProcessing.h>
-
-#include <TError.h>
 
 #include <fairlogger/Logger.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
 using namespace o2;
 using namespace o2::framework;
 using namespace o2::framework::expressions;
+
+struct Photon {
+  Photon(float eta_tmp, float phi_tmp, float energy_tmp, int clusid = 0, uint8_t sm_tmp = 0)
+    : eta(eta_tmp),
+      phi(phi_tmp),
+      energy(energy_tmp),
+      theta(2.f * std::atan2(std::exp(-eta), 1)),
+      px(energy * std::sin(theta) * std::cos(phi)),
+      py(energy * std::sin(theta) * std::sin(phi)),
+      pz(energy * std::cos(theta)),
+      pt(std::sqrt(px * px + py * py)),
+      photon(px, py, pz, energy),
+      id(clusid),
+      sm(sm_tmp),
+      onDCal(phi < 6 && phi > 4) // o2-linter: disable=magic-number (DCal phi range)
+  {
+  }
+
+  float eta;
+  float phi;
+  float energy;
+  float theta;
+  float px;
+  float py;
+  float pz;
+  float pt;
+  ROOT::Math::PxPyPzEVector photon;
+  int id;
+  uint8_t sm;
+  bool onDCal{phi < 6 && phi > 4}; // Checks whether photon is in phi region of the DCal, otherwise: EMCal
+};
+struct Meson {
+  Meson(Photon const& p1, Photon const& p2) : pgamma1(p1), pgamma2(p2), pMeson(p1.photon + p2.photon)
+  {
+  }
+  Photon pgamma1;
+  Photon pgamma2;
+  ROOT::Math::PxPyPzEVector pMeson;
+
+  [[nodiscard]] float getMass() const { return pMeson.M(); }
+  [[nodiscard]] float getPt() const { return pMeson.Pt(); }
+  [[nodiscard]] float eta() const { return pMeson.Eta(); }
+  [[nodiscard]] float phi() const { return pMeson.Phi(); }
+  [[nodiscard]] float getOpeningAngle() const
+  {
+    float cosAngle = pgamma1.photon.Vect().Dot(pgamma2.photon.Vect()) / (pgamma1.photon.P() * pgamma2.photon.P());
+    float angle = std::acos(std::clamp(cosAngle, -1.0f, 1.0f));
+    return angle;
+  }
+  [[nodiscard]] ROOT::Math::PxPyPzEVector getMathVector() const { return pMeson; }
+};
 
 struct neutralMesonInFullJets {
   HistogramRegistry registry;
@@ -68,6 +125,10 @@ struct neutralMesonInFullJets {
     FullR,
     HalfR
   };
+  enum class MesonReconstructionScheme {
+    JetConstituents,
+    AllClusters
+  };
 
   // CONFIGURABLES
   // General event Configurables
@@ -79,6 +140,8 @@ struct neutralMesonInFullJets {
   Configurable<bool> applyRCTSelections{"applyRCTSelections", true, "decide to apply RCT selections"};
   Configurable<std::string> eventSelections{"eventSelections", "selMC", "choose event selection"}; // selMC for MC and sel8 for data
   Configurable<int> matchingScheme{"matchingScheme", 2, "Matching scheme: 0 = Geo, 1 = Pt, 2 = GeoAndPt"};
+  Configurable<int> mesonReconstructionScheme{"mesonReconstructionScheme", 0, "Meson reconstruction scheme: 0 = Jet constituents, 1 = All event clusters"};
+  Configurable<float> maxMesonJetDeltaR{"maxMesonJetDeltaR", 0.4f, "Maximum delta R for meson-jet association"};
 
   // Jet Configurables
   Configurable<float> jetPtMin{"jetPtMin", 5.0, "minimum jet pT cut"};
@@ -90,6 +153,7 @@ struct neutralMesonInFullJets {
   // Track Configurables
 
   // Cluster or EMCAL Configurables
+  // Configurable<float> mMinOpenAngleCut{"mMinOpenAngleCut", 0.0202, "apply min opening angle cut"};
 
   std::vector<int> eventSelectionBits;
 
@@ -153,6 +217,16 @@ struct neutralMesonInFullJets {
     registry.add("h_data_jet_acceptance_counter", "Data jet acceptance Counter; Data jets; jet status; entries", {HistType::kTH1F, {{2, 0.0, 2.0}}});
     registry.add("h_mcd_jet_acceptance_counter", "MCD jet acceptance Counter; MCD jets; jet status; entries", {HistType::kTH1F, {{2, 0.0, 2.0}}});
     registry.add("h_mcp_jet_acceptance_counter", "MCP jet acceptance Counter; MCP jets; jet status; entries", {HistType::kTH1F, {{2, 0.0, 2.0}}});
+
+    // Meson in jet measurements
+    registry.add("h_mcd_meson_invarient_mass_JetConstituents", "MCD Mesons JetConstituents; invariant mass; entries", {HistType::kTH1F, {{100, 0.0, 1.0}}});
+    registry.add("h_mcd_meson_invarient_mass_pt_JetConstituents", "MCD Mesons JetConstituents; invariant mass; #p_{T, MCD}; entries", {HistType::kTH2F, {{100, 0.0, 1.0}, {100, 0.0, 100.}}});
+    registry.add("h_mcd_true_pi0_mass_JetConstituents", "MCD True Mesons JetConstituents; invariant mass; entries", {HistType::kTH1F, {{100, 0.0, 1.0}}});
+    registry.add("h_mcd_background_mass_JetConstituents", "MCD Background Mesons JetConstituents; invariant mass; entries", {HistType::kTH1F, {{100, 0.0, 1.0}}});
+    registry.add("h_mcd_meson_invarient_mass_AllClusters", "MCD Mesons AllClusters; invariant mass; entries", {HistType::kTH1F, {{100, 0.0, 1.0}}});
+    registry.add("h_mcd_meson_invarient_mass_pt_AllClusters", "MCD Mesons AllClusters; invariant mass; #p_{T, MCD}; entries", {HistType::kTH2F, {{100, 0.0, 1.0}, {100, 0.0, 100.}}});
+    registry.add("h_mcd_true_pi0_mass_AllClusters", "MCD True Mesons AllClusters; invariant mass; entries", {HistType::kTH1F, {{100, 0.0, 1.0}}});
+    registry.add("h_mcd_background_mass_AllClusters", "MCD Background Mesons AllClusters; invariant mass; entries", {HistType::kTH1F, {{100, 0.0, 1.0}}});
   }
 
   // TABLES
@@ -162,6 +236,8 @@ struct neutralMesonInFullJets {
   // Tables with added EMCAL information, especially for acceptance
   using EMCCollisionsData = o2::soa::Join<aod::JetCollisions, aod::JEMCCollisionLbs>;   // JetCollisions with EMCAL Collision Labels
   using EMCCollisionsMCD = o2::soa::Join<aod::JetCollisionsMCD, aod::JEMCCollisionLbs>; // where, JetCollisionsMCD = JetCollisions+JMcCollisionLbs
+  // For constituent information
+  using JetTableMCDWithConstituents = soa::Join<aod::FullMCDetectorLevelJets, aod::FullMCDetectorLevelJetConstituents>;
 
   // Filters
   Filter jetCuts = aod::jet::pt > jetPtMin;
@@ -169,6 +245,7 @@ struct neutralMesonInFullJets {
 
   PresliceOptional<JetTableMCPMatchedJoined> JetMCPPerMcCollision = aod::jet::mcCollisionId;                      // used in MC matching
   PresliceUnsortedOptional<aod::JetCollisionsMCD> CollisionsPerMCPCollision = aod::jmccollisionlb::mcCollisionId; // ensure a for a MCP collision a matched MCD collision is accepted
+  PresliceOptional<aod::EMCALClusters> ClusterPerCollision = aod::emcalcluster::collisionId;                      // EMCAL cluster per collision
 
   // HELPER FUNCTIONS
   // fill jet pt, eta and phi histograms for DataType Data, MCP and MCD
@@ -540,7 +617,6 @@ struct neutralMesonInFullJets {
       }
     }
   }
-
   // PROCESSES
 
   // Dummy for testing
@@ -640,6 +716,236 @@ struct neutralMesonInFullJets {
     }
   }
   PROCESS_SWITCH(neutralMesonInFullJets, processJetMatching, "Jet matching for MC-based unfolding", false)
+
+  /// Meson measurement helper functions
+  template <typename ClusterTable>
+  std::vector<Photon> reconstructPhotonsFromAllClusters(ClusterTable const& clusters)
+  {
+    std::vector<Photon> photons;
+
+    for (const auto& cluster : clusters) {
+      // cluster selection
+      photons.emplace_back(cluster.eta(), cluster.phi(), cluster.energy(), cluster.globalIndex());
+    }
+    return photons;
+  }
+
+  template <typename Jet>
+  std::vector<Photon> reconstructPhotonsFromJetClusters(Jet const& jet)
+  {
+    std::vector<Photon> photons;
+    for (const auto& cluster : jet.template clusters_as<aod::JetClustersMCD>()) {
+      // cluster selection
+      photons.emplace_back(cluster.eta(), cluster.phi(), cluster.energy(), cluster.globalIndex());
+    }
+    return photons;
+  }
+
+  std::vector<Meson> reconstructMesons(std::vector<Photon> const& photons)
+  {
+    std::vector<Meson> mesons;
+    for (size_t i = 0; i < photons.size(); ++i) {
+      for (size_t j = i + 1; j < photons.size(); ++j) {
+        Meson meson(photons[i], photons[j]);
+        // Apply opening angle and other meson cuts
+        mesons.push_back(meson);
+      }
+    }
+    return mesons;
+  }
+
+  template <typename Meson, typename Jet>
+  float getMesonJetDeltaR(Meson const& meson, Jet const& jet)
+  {
+    const float deltaEta = meson.eta() - jet.eta();
+    const float deltaPhi = std::atan2(std::sin(meson.phi() - jet.phi()), std::cos(meson.phi() - jet.phi()));
+    return std::sqrt(deltaEta * deltaEta + deltaPhi * deltaPhi);
+  }
+
+  template <typename Meson, typename JetTable>
+  auto findClosestJet(Meson const& meson, JetTable const& jets)
+  {
+    using JetType = std::remove_reference_t<decltype(*jets.begin())>;
+    float minDeltaR = maxMesonJetDeltaR;
+    JetType const* closestJet = nullptr;
+    for (const auto& jet : jets) {
+      const float deltaR = getMesonJetDeltaR(meson, jet);
+      if (deltaR < minDeltaR) {
+        minDeltaR = deltaR;
+        closestJet = &jet;
+      }
+    }
+    return closestJet;
+  }
+
+  template <typename McParticle>
+  int findPi0Ancestors(McParticle const& particle,
+                       aod::McParticles const& mcParticles,
+                       std::vector<int>& pi0Ancestors,
+                       std::vector<int>& visited)
+  {
+    for (auto motherId : particle.mothersIds()) {
+      if (motherId < 0) {
+        continue;
+      }
+
+      if (std::find(visited.begin(), visited.end(), motherId) != visited.end()) {
+        continue;
+      }
+      visited.push_back(motherId);
+      auto mother = mcParticles.iteratorAt(motherId);
+
+      if (std::abs(mother.pdgCode()) == 111) {
+        pi0Ancestors.push_back(motherId);
+      }
+      findPi0Ancestors(mother, mcParticles, pi0Ancestors, visited);
+    }
+  }
+
+  template <typename McParticles>
+  bool isTruePi0(Meson const& meson,
+                 aod::EMCALMCClusters const& mcClusterLables,
+                 McParticles const& mcParticles)
+  {
+    auto mcCluster1 = mcClusterLables.iteratorAt(meson.pgamma1.id);
+    auto mcCluster2 = mcClusterLables.iteratorAt(meson.pgamma2.id);
+
+    auto const& particleIds1 = mcCluster1.mcParticleIds();
+    auto const& amplitudes1 = mcCluster1.amplitudeA();
+
+    auto const& particleIds2 = mcCluster2.mcParticleIds();
+    auto const& amplitudes2 = mcCluster2.amplitudeA();
+
+    if (particleIds1.empty() || amplitudes1.empty() || particleIds2.empty() || amplitudes2.empty()) {
+      return false;
+    }
+    if (particleIds1.size() != amplitudes1.size() || particleIds2.size() != amplitudes2.size()) {
+      return false;
+    }
+
+    auto leadingIt1 = std::max_element(amplitudes1.begin(), amplitudes1.end());
+    auto leadingIndex1 = std::distance(amplitudes1.begin(), leadingIt1);
+    int mcParticleId1 = particleIds1[leadingIndex1];
+    auto leadingIt2 = std::max_element(amplitudes2.begin(), amplitudes2.end());
+    auto leadingIndex2 = std::distance(amplitudes2.begin(), leadingIt2);
+    int mcParticleId2 = particleIds2[leadingIndex2];
+
+    auto particle1 = mcParticles.iteratorAt(mcParticleId1);
+    auto particle2 = mcParticles.iteratorAt(mcParticleId2);
+
+    // Change this so that it does not necessarily can be a photon, and it can go back further in the ancestory until it reaches a pi0 or is empty (no mother/end of ancestory)
+
+    std::vector<int> pi0Ancestors1;
+    std::vector<int> pi0Ancestors2;
+
+    std::vector<int> visited1;
+    std::vector<int> visited2;
+
+    findPi0Ancestors(particle1, mcParticles, pi0Ancestors1, visited1);
+    findPi0Ancestors(particle2, mcParticles, pi0Ancestors2, visited2);
+
+    for (auto pi0Id1 : pi0Ancestors1) {
+      for (auto pi0Id2 : pi0Ancestors2) {
+        if (pi0Id1 == pi0Id2) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  template <DataType type, MesonReconstructionScheme Scheme, typename Meson, typename Jet, typename McClusterLabels, typename McParticles>
+  void fillMesonsInJet(Meson const& meson, Jet const& jet, McClusterLabels const& mcClusterLabels, McParticles const& mcParticles)
+  {
+    if constexpr (type == DataType::Data) {
+      if constexpr (Scheme == MesonReconstructionScheme::JetConstituents) {
+        // Add hists
+      } else if constexpr (Scheme == MesonReconstructionScheme::AllClusters) {
+        // Add hists
+      } else {
+        LOGF(fatal, "Invalid meson reconstruction scheme: %d", Scheme);
+      }
+    } else if constexpr (type == DataType::MCD) {
+      bool isPi0 = isTruePi0(meson, mcClusterLabels, mcParticles);
+      if constexpr (Scheme == MesonReconstructionScheme::JetConstituents) {
+        registry.fill(HIST("h_mcd_meson_invarient_mass_JetConstituents"), meson.getMass());
+        registry.fill(HIST("h_mcd_meson_invarient_mass_pt_JetConstituents"), meson.getMass(), meson.getPt());
+        // Add hists
+        if (isPi0) {
+          registry.fill(HIST("h_mcd_true_pi0_mass_JetConstituents"),
+                        meson.getMass());
+        } else {
+          registry.fill(HIST("h_mcd_background_mass_JetConstituents"),
+                        meson.getMass());
+        }
+      } else if constexpr (Scheme == MesonReconstructionScheme::AllClusters) {
+        registry.fill(HIST("h_mcd_meson_invarient_mass_AllClusters"), meson.getMass());
+        registry.fill(HIST("h_mcd_meson_invarient_mass_pt_AllClusters"), meson.getMass(), meson.getPt());
+        // Add hists
+        if (isPi0) {
+          registry.fill(HIST("h_mcd_true_pi0_mass_AllClusters"),
+                        meson.getMass());
+        } else {
+          registry.fill(HIST("h_mcd_background_mass_AllClusters"),
+                        meson.getMass());
+        }
+      } else {
+        LOGF(fatal, "Invalid meson reconstruction scheme: %d", Scheme);
+      }
+    } else {
+      LOGF(fatal, "Invalid data type: %d", type);
+    }
+  }
+
+  void processMCDMesonsInFullJets(
+    EMCCollisionsMCD::iterator const& collision,
+    soa::Filtered<JetTableMCDWithConstituents> const& jets,
+    aod::EMCALClusters const& clusters,
+    aod::JetClustersMCD const&,
+    aod::EMCALMCClusters const& mcClusterLabels,
+    aod::McParticles const& mcParticles)
+  {
+    const float weight = collision.weight();
+    const float pTHat = 10. / (std::pow(weight, 1.0 / pTHatExponent));
+
+    if (!eventSelection<DataType::MCD>(
+          collision, jets, weight, pTHat)) {
+      return;
+    }
+
+    switch (static_cast<MesonReconstructionScheme>(mesonReconstructionScheme.value)) {
+      case MesonReconstructionScheme::JetConstituents: {
+
+        for (const auto& jet : jets) {
+          auto photons = reconstructPhotonsFromJetClusters(jet);
+          auto mesons = reconstructMesons(photons);
+          for (const auto& meson : mesons) {
+            fillMesonsInJet<DataType::MCD, MesonReconstructionScheme::JetConstituents>(meson, jet, mcClusterLabels, mcParticles);
+          }
+        }
+        break;
+      }
+
+      case MesonReconstructionScheme::AllClusters: {
+
+        auto clustersPerCollision = clusters.sliceBy(ClusterPerCollision, collision.globalIndex());
+        auto photons = reconstructPhotonsFromAllClusters(clustersPerCollision);
+        auto mesons = reconstructMesons(photons);
+        for (const auto& meson : mesons) {
+          auto associatedJet = findClosestJet(meson, jets);
+          if (associatedJet == nullptr) {
+            continue;
+          }
+          fillMesonsInJet<DataType::MCD, MesonReconstructionScheme::AllClusters>(meson, *associatedJet, mcClusterLabels, mcParticles);
+        }
+        break;
+      }
+
+      default:
+        LOGF(fatal, "Invalid meson reconstruction scheme: %d", mesonReconstructionScheme.value);
+    }
+  }
+  PROCESS_SWITCH(neutralMesonInFullJets, processMCDMesonsInFullJets, "Measuring mesons in full jets in MCD", false)
 };
 
 WorkflowSpec defineDataProcessing(ConfigContext const& cfgc)
