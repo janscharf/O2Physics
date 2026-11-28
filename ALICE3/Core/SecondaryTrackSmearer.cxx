@@ -191,8 +191,11 @@ bool SecondaryTrackSmearer::smearTrack(O2Track& track, const SecondaryLutEntry* 
     *wasSmeared = false;
   }
   if (!entry || !entry->valid) {
-    LOG(warn) << "Cannot smear a track with a missing or invalid secondary LUT entry";
-    return false;
+    LOG(debug) << "Cannot smear a track with a missing or invalid secondary LUT entry";
+    if (mAllowSmearingFailures && wasSmeared) {
+      *wasSmeared = true; // track is kept with MC parameters
+    }
+    return mAllowSmearingFailures;
   }
   const float selectedEfficiency = mInterpolateEfficiency ? interpolatedEff : efficiency(*entry);
   if (mUseEfficiency && (!std::isfinite(selectedEfficiency) || selectedEfficiency < 0.f || selectedEfficiency > 1.f)) {
@@ -205,7 +208,10 @@ bool SecondaryTrackSmearer::smearTrack(O2Track& track, const SecondaryLutEntry* 
       !std::all_of(entry->eigvec.begin(), entry->eigvec.end(), finite) ||
       !std::all_of(entry->eiginv.begin(), entry->eiginv.end(), finite)) {
     LOG(error) << "Cannot smear a track with non-finite secondary LUT parameters";
-    return false;
+    if (mAllowSmearingFailures && wasSmeared) {
+      *wasSmeared = true; // track is kept with MC parameters
+    }
+    return mAllowSmearingFailures;
   }
   lutEntry_t flatEntry;
   flatEntry.valid = entry->valid;
